@@ -1,0 +1,9 @@
+.env
+app/api/__pycache__/routes_ingest.cpython-313.pyc
+app/services/__pycache__/llm_service.cpython-313.pyc
+app/services/__pycache__/registry.cpython-313.pyc
+app/services/__pycache__/scraper_service.cpython-313.pyc
+app/services/__pycache__/vector_service.cpython-313.pyc
+storage/registry.db
+storage/faiss_index/index.faiss
+storage/faiss_index/index.pkl
