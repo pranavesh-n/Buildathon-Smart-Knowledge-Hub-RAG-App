@@ -8,27 +8,54 @@ from app.services.vector_service import VectorStoreService
 
 
 class RAGChatService:
-    """Handles Multilingual Retrieval-Augmented Generation (RAG) with strict language detection."""
+    """Handles Multilingual Retrieval-Augmented Generation (RAG) with strict guardrails."""
 
     def __init__(self, vector_service: VectorStoreService) -> None:
         self.vector_service = vector_service
         self.llm = ChatOpenAI(
             model=CHAT_MODEL,
             api_key=SecretStr(OPENAI_API_KEY),
-            temperature=0.2,
+            temperature=0.0,  # Zero temperature for strict factual grounding
         )
 
     @staticmethod
+    def _check_input_guardrails(question: str) -> Optional[str]:
+        """
+        Blocks prompt injection attempts, system prompt leaks, and unsafe inputs
+        before spending OpenAI API tokens.
+        """
+        q_lower = question.lower().strip()
+
+        injection_patterns = [
+            "ignore previous instructions",
+            "ignore all instructions",
+            "disregard above",
+            "reveal your system prompt",
+            "show system prompt",
+            "secret instructions",
+            "bypass guardrail",
+            "you are now dan",
+            "act as an unrestricted",
+        ]
+        for pattern in injection_patterns:
+            if pattern in q_lower:
+                return (
+                    "🛡️ **Security Guardrail Triggered:** Prompt injection or system-override "
+                    "instructions are blocked. Please ask a question related to your saved websites or PDFs."
+                )
+
+        if len(question) > 1500:
+            return (
+                "🛡️ **Input Guardrail Triggered:** Your question exceeds the maximum safe length "
+                "(1,500 characters). Please shorten your query."
+            )
+
+        return None
+
+    @staticmethod
     def _detect_input_language(question: str, selected_language: str) -> str:
-        """
-        Determines the exact target language for the AI response based on:
-        1. Explicit language requests inside the user's prompt (e.g., "explain in tamil")
-        2. Unicode script detection on the current question (Tamil, Malayalam, Hindi, Telugu, Kannada)
-        3. Dropdown selection fallback
-        """
         q_lower = question.lower()
 
-        # 1. Check if the user explicitly asked for a language inside their question text
         explicit_map = {
             "in tamil": "Tamil (தமிழ்)",
             "tamil la": "Tamil (தமிழ்)",
@@ -43,7 +70,6 @@ class RAGChatService:
             if phrase in q_lower:
                 return lang_name
 
-        # 2. Check Unicode script ranges in the user's current question
         if re.search(r"[\u0B80-\u0BFF]", question):
             return "Tamil (தமிழ்)"
         if re.search(r"[\u0D00-\u0D7F]", question):
@@ -55,11 +81,9 @@ class RAGChatService:
         if re.search(r"[\u0C80-\u0CBF]", question):
             return "Kannada (ಕನ್ನಡ)"
 
-        # 3. If user selected a forced output language in the dropdown, honor it
         if selected_language and selected_language not in ("Auto-Detect", "English"):
             return selected_language
 
-        # 4. Otherwise, the user typed in standard English / Latin characters -> Reply in English!
         return "English"
 
     def ask_question(
@@ -70,6 +94,16 @@ class RAGChatService:
         language: str = "Auto-Detect",
         k: int = 8,
     ) -> Dict[str, Any]:
+        # 1. Input Security Guardrail
+        guardrail_violation = self._check_input_guardrails(question)
+        if guardrail_violation:
+            return {
+                "answer": guardrail_violation,
+                "citations": [],
+                "chunks_used": 0,
+            }
+
+        # 2. Empty Library Guardrail
         all_sources = self.vector_service.registry.list_all_sources()
         if not all_sources:
             return {
@@ -117,34 +151,36 @@ class RAGChatService:
             else "No specific text excerpts matched."
         )
 
-        # Resolve exact target language for this specific turn
         target_language = self._detect_input_language(question, language)
 
         if target_language == "English":
             lang_instruction = (
                 "STRICT LANGUAGE RULE: The user asked this question in **English**. "
-                "You MUST write your entire response in **English** ONLY. "
-                "Do NOT reply in Tamil, Hindi, or any other language, even if earlier chat messages "
-                "or source excerpts contain regional language text."
+                "You MUST write your entire response in **English** ONLY."
             )
         else:
             lang_instruction = (
                 f"STRICT LANGUAGE RULE: You MUST write your entire response in **{target_language}** "
-                f"(using natural {target_language} script, while keeping product model numbers, "
-                f"currency symbols like ₹, and URLs intact)."
+                f"(using natural {target_language} script)."
             )
 
+        # 3. Strict Anti-Hallucination & Out-of-Scope Guardrail
         system_prompt = (
-            "You are Smart AI Assistant, a friendly, accurate knowledge assistant.\n"
-            "You have access to the user's saved websites and uploaded PDF documents listed below.\n\n"
+            "You are Smart AI Assistant, a strictly grounded knowledge assistant.\n"
+            "You ONLY answer questions using the facts explicitly present in the user's "
+            "SAVED ITEMS IN LIBRARY and RETRIEVED KNOWLEDGE EXCERPTS below.\n\n"
             f"{lang_instruction}\n\n"
             f"=== SAVED ITEMS IN LIBRARY ===\n{inventory_text}\n\n"
             f"=== RETRIEVED KNOWLEDGE EXCERPTS ===\n{formatted_context}\n"
             "====================================\n\n"
-            "Guidelines:\n"
-            "1. Answer clearly and accurately using the retrieved excerpts and saved items list above.\n"
-            "2. Present comparisons, products, schemes, or policies using clean bullet points or Markdown tables.\n"
-            "3. Speak naturally like a helpful human expert—never use robotic phrases like 'Based on the retrieved context'."
+            "CRITICAL GUARDRAIL RULES (MUST FOLLOW):\n"
+            "1. NEVER use your general pre-trained world knowledge to answer questions about external topics "
+            "(such as sports, World Cup winners, geography, capitals, celebrities, history, or general coding) "
+            "if those facts are NOT explicitly written inside the RETRIEVED KNOWLEDGE EXCERPTS above.\n"
+            "2. If the user's question is unrelated to the saved websites/PDFs or the answer cannot be found "
+            "in the excerpts above, you MUST refuse to answer from general knowledge and reply ONLY with:\n"
+            "   '🛡️ **Out-of-Scope Guardrail:** I can only answer questions based on the websites and PDF documents saved in your library. This information is not present in your saved sources.' (translated into the target language if applicable).\n"
+            "3. When the answer IS in the excerpts, present comparisons, schemes, products, or policies clearly using bullet points or Markdown tables."
         )
 
         messages: List[Any] = [SystemMessage(content=system_prompt)]
@@ -158,10 +194,14 @@ class RAGChatService:
                 elif role == "assistant" and content:
                     messages.append(AIMessage(content=content))
 
-        # Reinforce language instruction on the final human turn so chat_history never overrides it
         messages.append(
             HumanMessage(
-                content=f"{question}\n\n[System Note: Reply strictly in {target_language}]"
+                content=(
+                    f"User Question: {question}\n\n"
+                    f"[System Guardrail Reminder: Answer ONLY if the facts exist in the RETRIEVED KNOWLEDGE EXCERPTS. "
+                    f"If the question asks about general world knowledge not in the excerpts, trigger the Out-of-Scope Guardrail refusal immediately. "
+                    f"Reply strictly in {target_language}.]"
+                )
             )
         )
 

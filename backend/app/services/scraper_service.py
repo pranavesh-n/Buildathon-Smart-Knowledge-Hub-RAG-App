@@ -230,6 +230,7 @@ class PlaywrightUniversalScraper:
         captured_json: List[Dict[str, Any]] = []
         html_content = ""
         page_title = url
+        rendered_inner_text = ""
 
         update_live_state(
             step="🚀 Launching headless browser...",
@@ -297,13 +298,28 @@ class PlaywrightUniversalScraper:
                     progress=25,
                 )
 
-                # Use faster 18s timeout; if domcontentloaded times out on heavy sites, still grab partial DOM
+                nav_response = None
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=18000)
+                    nav_response = page.goto(
+                        url, wait_until="domcontentloaded", timeout=22000
+                    )
                 except Exception:
-                    page.goto(url, wait_until="commit", timeout=12000)
+                    nav_response = page.goto(
+                        url, wait_until="commit", timeout=15000
+                    )
 
-                page.wait_for_timeout(1200)
+                if nav_response and nav_response.status >= 400:
+                    browser.close()
+                    update_live_state(
+                        step=f"⚠️ Website returned HTTP {nav_response.status} (Blocked or Not Found).",
+                        progress=0,
+                        active=False,
+                        reset_screenshot=True,
+                        mode="error",
+                    )
+                    return []
+
+                page.wait_for_timeout(1500)
 
                 # Snapshot 1: Initial Viewport
                 try:
@@ -316,27 +332,37 @@ class PlaywrightUniversalScraper:
                 except Exception:
                     pass
 
-                # Scroll 1: Load lazy products/tables
+                # Scroll 1 & 2: Trigger lazy-loaded document pages (like Scribd / Flipkart)
                 try:
-                    page.evaluate("window.scrollBy(0, 1000)")
-                    page.wait_for_timeout(700)
+                    page.evaluate("window.scrollBy(0, 900)")
+                    page.wait_for_timeout(800)
                     snap2 = page.screenshot(type="jpeg", quality=55, timeout=5000)
                     update_live_state(
-                        step="🔍 Scrolling page to capture tables & products...",
+                        step="🔍 Scrolling document to capture pages & tables...",
                         progress=62,
                         screenshot_bytes=snap2,
                     )
+                    page.evaluate("window.scrollBy(0, 1200)")
+                    page.wait_for_timeout(800)
                 except Exception:
                     pass
 
-                # Scroll 2: Return to top for clean final preview
+                # Grab visible rendered text directly from Chromium DOM (crucial for Scribd/SPAs!)
+                try:
+                    rendered_inner_text = page.evaluate(
+                        "() => document.body ? document.body.innerText : ''"
+                    )
+                except Exception:
+                    rendered_inner_text = ""
+
+                # Return to top for clean final preview
                 try:
                     page.evaluate("window.scrollTo(0, 0)")
                     page.wait_for_timeout(300)
                     snap_top = page.screenshot(type="jpeg", quality=60, timeout=5000)
                     update_live_state(
-                        step="📊 Extracting structured tables, text & links...",
-                        progress=75,
+                        step="📊 Extracting structured text, tables & links...",
+                        progress=78,
                         screenshot_bytes=snap_top,
                     )
                 except Exception:
@@ -349,7 +375,7 @@ class PlaywrightUniversalScraper:
         except Exception as pw_err:
             print(f"[Playwright Info] Using direct HTTP fallback for {url}: {pw_err}")
             update_live_state(
-                step="⚡ Browser blocked or timed out. Trying fast direct reader...",
+                step="⚡ Using fast direct reader for website...",
                 progress=55,
             )
             try:
@@ -359,6 +385,7 @@ class PlaywrightUniversalScraper:
                         step=f"⚠️ Website blocked automated access (HTTP {resp.status_code}).",
                         progress=0,
                         active=False,
+                        reset_screenshot=True,
                         mode="error",
                     )
                     return []
@@ -369,20 +396,21 @@ class PlaywrightUniversalScraper:
                     step="❌ Website unreachable or blocked automated access.",
                     progress=0,
                     active=False,
+                    reset_screenshot=True,
                     mode="error",
                 )
                 return []
 
-        if not html_content.strip():
+        if not html_content.strip() and not rendered_inner_text.strip():
             update_live_state(
                 step="❌ Website returned an empty response.",
                 progress=0,
                 active=False,
+                reset_screenshot=True,
                 mode="error",
             )
             return []
 
-        # 2. Parse HTML with BeautifulSoup
         soup = BeautifulSoup(html_content, "lxml")
         if soup.title and soup.title.string:
             page_title = soup.title.string.strip()
@@ -409,7 +437,7 @@ class PlaywrightUniversalScraper:
                 )
             )
 
-        # Extract meta descriptions (useful for document viewers like Scribd/SlideShare)
+        # Extract meta descriptions & JSON-LD (captures Scribd document summaries & titles)
         meta_lines: List[str] = []
         for meta in soup.find_all("meta"):
             if isinstance(meta, Tag):
@@ -441,17 +469,26 @@ class PlaywrightUniversalScraper:
 
         body_lines: List[str] = list(meta_lines)
         seen_lines = set(meta_lines)
+
+        # Combine BeautifulSoup HTML elements + Playwright's rendered innerText (for Scribd/Canvas/SPAs)
         for element in soup.find_all(["h1", "h2", "h3", "h4", "p", "li", "span", "div"]):
             if isinstance(element, Tag):
                 text = " ".join(element.stripped_strings)
-                if (18 < len(text) < 600 or "₹" in text) and text not in seen_lines:
+                if (15 < len(text) < 1200 or "₹" in text) and text not in seen_lines:
                     seen_lines.add(text)
                     body_lines.append(text)
+
+        if rendered_inner_text:
+            for raw_line in rendered_inner_text.splitlines():
+                clean_line = raw_line.strip()
+                if len(clean_line) > 15 and clean_line not in seen_lines:
+                    seen_lines.add(clean_line)
+                    body_lines.append(clean_line)
 
         if body_lines:
             clean_body_text = (
                 f"### Webpage Content: {page_title} ({url})\n"
-                + "\n".join(body_lines[:400])
+                + "\n".join(body_lines[:500])
             )
             documents.append(
                 Document(
@@ -504,9 +541,10 @@ class PlaywrightUniversalScraper:
 
         if not documents:
             update_live_state(
-                step="⚠️ No readable text found (site may require login or PDF upload).",
+                step="⚠️ No readable text found on this page.",
                 progress=0,
                 active=False,
+                reset_screenshot=True,
                 mode="error",
             )
             return []
@@ -516,3 +554,4 @@ class PlaywrightUniversalScraper:
             progress=94,
         )
         return documents
+    

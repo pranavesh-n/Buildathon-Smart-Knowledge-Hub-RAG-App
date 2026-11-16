@@ -415,12 +415,33 @@ export default function App() {
     }
   }, [messages, chatLoading, isChatOpen, isMaximized]);
 
-  // Step 1A: Add Website Link (With 40s Timeout & Clean Error Recovery)
+  // Step 1A: Add Website Link (With URL Scheme Guardrail, 40s Timeout & Safe Error Handling)
   const handleUrlScrape = async (e) => {
     e.preventDefault();
     if (!urlInput.trim()) return;
 
     const targetUrl = urlInput.trim();
+
+    // Guardrail: Block ftp://, file://, or non-http(s) protocols before calling backend
+    if (!/^https?:\/\/.+/i.test(targetUrl)) {
+      const schemeMsg =
+        "🛡️ Invalid URL Guardrail: Only valid 'http://' or 'https://' website links are allowed (e.g., https://example.com).";
+      setIngestStatus({
+        type: "error",
+        message: schemeMsg,
+      });
+      setLiveState({
+        active: false,
+        mode: "error",
+        url: targetUrl,
+        step: "🛡️ Blocked: Invalid URL scheme (must start with http:// or https://)",
+        progress: 0,
+        screenshot: null,
+        logs: [schemeMsg],
+      });
+      return;
+    }
+
     setIngestLoading(true);
     setIngestStatus(null);
     setStageTab("scanner");
@@ -454,8 +475,10 @@ export default function App() {
       const errMsg =
         err.code === "ECONNABORTED"
           ? "This website took too long to respond (protected or login-only page). Try downloading the PDF and uploading it in Card 02!"
-          : err.response?.data?.detail ||
-            "Could not read this website (it may require a login or block automated readers).";
+          : extractErrorMessage(
+              err,
+              "Could not read this website (it may require a login or block automated readers)."
+            );
 
       setIngestStatus({
         type: "error",
@@ -466,7 +489,7 @@ export default function App() {
         active: false,
         mode: "error",
         url: targetUrl,
-        step: "⚠️ Scan stopped · Website blocked automated access",
+        step: "⚠️ Scan stopped · Website blocked or invalid",
         progress: 0,
         screenshot: null,
         logs: [errMsg],
@@ -1163,10 +1186,13 @@ export default function App() {
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       maxWidth: "82%",
+                      color: liveState.mode === "error" ? "#fca5a5" : "#cbd5e1",
                     }}
                   >
                     {ingestLoading
                       ? liveState.step || "Processing..."
+                      : liveState.mode === "error"
+                      ? liveState.step || "⚠️ Scan failed"
                       : liveState.progress === 100
                       ? liveState.step
                       : "Monitor Ready"}
@@ -1174,6 +1200,8 @@ export default function App() {
                   <span style={{ color: "#5eead4", fontWeight: 700 }}>
                     {ingestLoading
                       ? `${liveState.progress || 10}%`
+                      : liveState.mode === "error"
+                      ? "0%"
                       : `${liveState.progress || 0}%`}
                   </span>
                 </div>

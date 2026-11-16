@@ -108,7 +108,7 @@ class VectorStoreService:
                 progress=0,
                 active=False,
                 reset_screenshot=True,
-                mode="idle",
+                mode="error",
             )
             return {
                 "status": "error",
